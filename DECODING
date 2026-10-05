@@ -1,0 +1,185 @@
+import streamlit as st
+import cv2
+import numpy as np
+
+# Page configurations
+st.set_page_config(
+    page_title="Fluorescence ASCII Decoder",
+    page_icon="🔬",
+    layout="wide"
+)
+
+# Custom CSS to strictly enforce file dialog and disable mobile camera capture hooks
+st.markdown("""
+    <style>
+    /* Styling aesthetics */
+    .reportview-container {
+        background: #fdfdfd;
+    }
+    /* Restrict file input attributes */
+    input[type="file"] {
+        capture: none !important;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+st.title("Fluorescence Pattern Binary & ASCII Decoder")
+st.markdown("""
+This application decodes hidden ASCII messages from solid mechanofluorochromic BTD11 patterns.
+* **Red Dots (Pristine)**: Decoded as `0`
+* **Orange-Yellow Dots (Ground)**: Decoded as `1`
+* **Sorting Principle**: Sequential scan from **Top-to-Bottom**, then **Left-to-Right**
+* **Mapping**: 88 binary bits $\\rightarrow$ 11 ASCII characters (8 bits/character)
+""")
+
+def classify_dot_color(roi_hsv):
+    """
+    Robust color classification with color tolerance in HSV space.
+    Returns: '0' for Red, '1' for Orange-Yellow, or None for background/noise.
+    """
+    mean_h = np.mean(roi_hsv[:, :, 0])
+    mean_s = np.mean(roi_hsv[:, :, 1])
+    mean_v = np.mean(roi_hsv[:, :, 2])
+    
+    # Filter dark/background noise
+    if mean_v < 40 or mean_s < 40:
+        return None
+        
+    # HSV Thresholds with tolerance:
+    # Yellow/Orange Hue in OpenCV is typically within [12, 40]
+    # Red Hue wraps around [0, 10] and [160, 180]
+    if 12 <= mean_h <= 40:
+        return "1"  # Ground state (Orange-Yellow)
+    elif mean_h <= 10 or mean_h >= 160:
+        return "0"  # Pristine state (Red)
+    else:
+        # Fallback based on Hue distance if slightly shifted
+        dist_to_yellow = abs(mean_h - 25)
+        dist_to_red = min(abs(mean_h - 0), abs(mean_h - 180))
+        return "1" if dist_to_yellow < dist_to_red else "0"
+
+def process_and_decode(image_bytes):
+    # Decode image from buffer
+    file_bytes = np.asarray(bytearray(image_bytes), dtype=np.uint8)
+    img_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+    # 1. Spot Detection via Contour Analysis
+    # Remove ambient background black level
+    _, thresh = cv2.threshold(gray, 35, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    detected_dots = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        # Filter tiny artifacts/noise and overly large edge reflections
+        if 8 <= area <= 1500:
+            M = cv2.moments(cnt)
+            if M["m00"] != 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+                detected_dots.append((cx, cy))
+
+    # 2. Sequential Sorting: Top-to-Bottom, then Left-to-Right
+    # Group coordinates into approximate rows (using a tolerance band delta_y)
+    # to avoid slight dot misalignments causing out-of-order errors
+    ROW_TOLERANCE = 15  # Adjust according to dot diameter/spacing
+    detected_dots = sorted(detected_dots, key=lambda p: p[1])  # Sort by Y first
+    
+    rows = []
+    for dot in detected_dots:
+        if not rows:
+            rows.append([dot])
+        else:
+            # If dot's Y is within ROW_TOLERANCE of the current row, append
+            if abs(dot[1] - rows[-1][0][1]) < ROW_TOLERANCE:
+                rows[-1].append(dot)
+            else:
+                rows.append([dot])
+                
+    # Sort each row from Left to Right (by X)
+    ordered_dots = []
+    for row in rows:
+        row_sorted = sorted(row, key=lambda p: p[0])
+        ordered_dots.extend(row_sorted)
+
+    # Limit to designated 88 dots
+    dots_to_decode = ordered_dots[:88]
+
+    binary_sequence = []
+    annotated_img = img_bgr.copy()
+
+    for idx, (x, y) in enumerate(dots_to_decode):
+        # Sample a 5x5 region around the centroid to reduce single-pixel noise
+        r = 2
+        y1, y2 = max(0, y - r), min(img_bgr.shape[0], y + r + 1)
+        x1, x2 = max(0, x - r), min(img_bgr.shape[1], x + r + 1)
+        roi = hsv[y1:y2, x1:x2]
+
+        bit = classify_dot_color(roi)
+        if bit is None:
+            bit = "0"  # Default baseline
+            
+        binary_sequence.append(bit)
+
+        # Visual indicator: Green for 1, Blue for 0
+        mark_color = (0, 255, 255) if bit == "1" else (0, 0, 255)
+        cv2.circle(annotated_img, (x, y), 3, mark_color, -1)
+        # Label index number
+        cv2.putText(annotated_img, str(idx + 1), (x - 4, y - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.22, (255, 255, 255), 1)
+
+    binary_str = "".join(binary_sequence)
+
+    # 3. 8-Bit Binary to ASCII Conversion
+    decoded_chars = []
+    byte_chunks = [binary_str[i:i+8] for i in range(0, len(binary_str), 8)]
+    for chunk in byte_chunks:
+        if len(chunk) == 8:
+            try:
+                char = chr(int(chunk, 2))
+                decoded_chars.append(char)
+            except ValueError:
+                decoded_chars.append("?")
+
+    decoded_text = "".join(decoded_chars)
+    return annotated_img, binary_str, byte_chunks, decoded_text
+
+# ----------------- UI Component -----------------
+st.sidebar.header("Image Upload")
+# accept_multiple_files=False, purely local file picker
+uploaded_file = st.sidebar.file_uploader(
+    "Select Local Image File (.png, .jpg, .tif)",
+    type=["png", "jpg", "jpeg", "tif", "bmp"],
+    accept_multiple_files=False,
+    help="Direct camera capture is disabled. Upload recorded image files only."
+)
+
+if uploaded_file is not None:
+    with st.spinner("Processing image and executing ASCII decoding..."):
+        annotated_img, binary_str, byte_chunks, decoded_text = process_and_decode(uploaded_file.read())
+
+    col_left, col_right = st.columns([3, 2])
+
+    with col_left:
+        st.subheader("1. Dot Detection & Sequential Indexing")
+        st.image(cv2.cvtColor(annotated_img, cv2.COLOR_BGR2RGB), use_container_width=True)
+        st.caption(f"Detected and decoded: {len(binary_str)} dots (Target: 88 dots).")
+
+    with col_right:
+        st.subheader("2. Binary Extraction (8-bit Grouping)")
+        formatted_stream = " ".join(byte_chunks)
+        st.code(formatted_stream, language="text")
+
+        st.subheader("3. Decoded ASCII Plaintext")
+        st.success(f"Result: **{decoded_text}**")
+        
+        # Breakdown Table
+        with st.expander("Detailed Byte-to-Char Mapping"):
+            st.table([
+                {"Index": f"Char {i+1}", "8-bit Binary": chunk, "Decimal": int(chunk, 2) if len(chunk) == 8 else "N/A", "ASCII Char": char}
+                for i, (chunk, char) in enumerate(zip(byte_chunks, decoded_text))
+            ])
+else:
+    st.info("Please upload an image from the sidebar to start.")
